@@ -6477,6 +6477,14 @@ main {
         position: fixed; /* Keep it visible */
     }
 }
+/* Fix modal hidden state */
+.modal-overlay {
+    display: none;
+}
+
+.modal-overlay.active {
+    display: flex;
+}
 
 /* 404 Page Styles */
 .error-page-body {
