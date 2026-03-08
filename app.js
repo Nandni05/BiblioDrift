@@ -33,8 +33,11 @@ const SafeStorage = {
         try {
             const keyParam = GOOGLE_API_KEY ? `&key=${GOOGLE_API_KEY}` : '';
             const encodedQuery = encodeURIComponent(query);
-            const res = await fetch(`${API_BASE}?q=${encodedQuery}&maxResults=${maxResults}&printType=books${keyParam}`);
-
+            
+            // Add pagination parameters
+            const startIndexParam = currentStartIndex > 0 ? `&startIndex=${currentStartIndex}` : '';
+            const res = await fetch(`${API_BASE}?q=${encodedQuery}&maxResults=${maxResults}${startIndexParam}${keyParam}`);
+            
             if (!res.ok) {
                 throw new Error(`API Error: ${res.statusText}`);
             }
@@ -42,7 +45,12 @@ const SafeStorage = {
             const data = await res.json();
 
             if (data.items && data.items.length > 0) {
-                container.innerHTML = '';
+                // If this is a new search, clear container
+                if (currentStartIndex === 0) {
+                    container.innerHTML = '';
+                }
+                
+                // Append new books instead of clearing
                 for (const book of data.items) {
                     const bookElement = await this.createBookElement(book);
                     container.appendChild(bookElement);
@@ -54,6 +62,10 @@ const SafeStorage = {
                         <p>No books found. The shelves are empty.</p>
                     </div>`;
             }
+            
+            // Check if we have more results
+            const hasMoreResults = data.items.length >= maxResults;
+            
         } catch (err) {
             console.error("Failed to fetch books", err);
             showToast("Failed to load bookshelf.", "error");
@@ -411,6 +423,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const performSearch = () => {
         if (searchInput && searchInput.value.trim()) {
+            // Reset pagination state for new search
+            currentSearchQuery = searchInput.value.trim();
+            currentStartIndex = 0;
+            hasMoreResults = true;
+            
             window.location.href = `index.html?q=${encodeURIComponent(searchInput.value.trim())}`;
         }
     };
@@ -675,8 +692,200 @@ function enableTapEffects() {
     }
 }
 
-// --- INITIALIZATION ---
-window.addEventListener('DOMContentLoaded', () => {
-    new ThemeManager();
-    new DiscoveryManager();
-});
+// =========================================
+//      BOOKSELLER RECOMMENDS (#46)           */
+// =========================================
+
+class BooksellerRecommends {
+    constructor() {
+        this.revealBtn = document.getElementById('reveal-vibe-btn');
+        this.aiBookTitle = document.getElementById('ai-book-title');
+        this.aiBookAuthor = document.getElementById('ai-book-author');
+        this.aiNoteContent = document.getElementById('ai-note-content');
+        this.recommendedBookCover = document.getElementById('recommended-book-cover');
+        
+        this.initEventListeners();
+    }
+
+    initEventListeners() {
+        if (this.revealBtn) {
+            this.revealBtn.addEventListener('click', () => this.fetchBooksellerRecommendation());
+        }
+    }
+
+    async fetchBooksellerRecommendation() {
+        try {
+            // Add loading state
+            this.setLoadingState(true);
+            
+            // Make API call to generate recommendation
+            const response = await fetch(`${MOOD_API_BASE}/generate-note`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    vibe: 'cozy discovery',
+                    intent: 'bookseller recommendation',
+                    description: 'A perfect book for a quiet afternoon of reading'
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            
+            if (data.success && data.data) {
+                // Update DOM with AI recommendation
+                this.updateRecommendationDisplay(data.data);
+                showToast('Bookseller recommendation ready!', 'info');
+            } else {
+                throw new Error(data.message || 'Invalid response format');
+            }
+
+        } catch (error) {
+            console.error('Error fetching bookseller recommendation:', error);
+            showToast('The bookseller is resting right now. Try again later.', 'error');
+            this.setLoadingState(false);
+        }
+    }
+
+    setLoadingState(isLoading) {
+        const noteCard = document.querySelector('.bookseller-note-card');
+        if (isLoading) {
+            noteCard.classList.add('loading');
+            this.revealBtn.textContent = 'Consulting bookseller...';
+            this.revealBtn.disabled = true;
+        } else {
+            noteCard.classList.remove('loading');
+            this.revealBtn.textContent = 'Reveal Vibe';
+            this.revealBtn.disabled = false;
+        }
+    }
+
+    updateRecommendationDisplay(data) {
+        // Update title and author
+        if (data.title) {
+            this.aiBookTitle.textContent = data.title;
+        }
+        if (data.author) {
+            this.aiBookAuthor.textContent = data.author;
+        }
+        
+        // Update AI note content
+        if (data.vibe) {
+            this.aiNoteContent.innerHTML = `<em>${data.vibe}</em>`;
+        }
+        
+        // Update book cover if available
+        if (data.cover_url) {
+            const coverImg = this.recommendedBookCover.querySelector('img');
+            if (coverImg) {
+                coverImg.src = data.cover_url;
+                coverImg.alt = data.title || 'Recommended Book';
+            }
+        }
+        
+        // Remove loading state
+        this.setLoadingState(false);
+        
+        // Trigger 3D book interaction if library-3d.js is available
+        if (window.Book3D) {
+            window.Book3D.initializeBook(this.recommendedBookCover);
+        }
+    }
+}
+
+// Initialize keyboard shortcuts when DOM is ready
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+        KeyboardShortcuts.init();
+        
+        // Initialize infinite scroll observer
+        setupInfiniteScrollObserver();
+    });
+} else {
+    KeyboardShortcuts.init();
+}
+
+// Infinite Scroll State Management
+let currentSearchQuery = '';
+let currentStartIndex = 0;
+const MAX_RESULTS = 20;
+let isFetching = false;
+let hasMoreResults = true;
+
+// Intersection Observer for Infinite Scroll
+function setupInfiniteScrollObserver() {
+    const sentinelElement = document.getElementById('scroll-sentinel');
+    if (!sentinelElement) return;
+    
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                if (!isFetching && hasMoreResults && currentSearchQuery !== '') {
+                    // Remove hidden class to show spinner
+                    sentinelElement.classList.remove('hidden');
+                    
+                    // Increment index and fetch more results
+                    currentStartIndex += MAX_RESULTS;
+                    
+                    // Fetch next batch
+                    fetchNextBatch();
+                }
+            }
+        });
+    }, {
+        rootMargin: '0px 0px 200px 0px'
+    });
+    
+    observer.observe(sentinelElement);
+}
+
+// Fetch next batch of results
+async function fetchNextBatch() {
+    try {
+        isFetching = true;
+        
+        // Hide spinner after fetch completes
+        const hideSpinner = () => {
+            sentinelElement.classList.add('hidden');
+            isFetching = false;
+        };
+        
+        const res = await fetch(`${API_BASE}?q=${encodeURIComponent(currentSearchQuery)}&maxResults=${MAX_RESULTS}&startIndex=${currentStartIndex}`);
+        
+        if (!res.ok) {
+            throw new Error(`API Error: ${res.statusText}`);
+        }
+        
+        const data = await res.json();
+        
+        if (data.items && data.items.length > 0) {
+            const container = document.getElementById('search-results');
+            const renderer = new BookRenderer(window.libManager);
+            
+            // Append new books instead of clearing
+            for (const book of data.items) {
+                const bookElement = await renderer.createBookElement(book);
+                container.appendChild(bookElement);
+            }
+            
+            // Check if we have more results
+            hasMoreResults = data.items.length >= MAX_RESULTS;
+        }
+        
+        hideSpinner();
+        
+    } catch (error) {
+        console.error('Error fetching next batch:', error);
+        showToast("Failed to load more books.", "error");
+        const hideSpinner = () => {
+            sentinelElement.classList.add('hidden');
+            isFetching = false;
+        };
+        hideSpinner();
+    }
+}
