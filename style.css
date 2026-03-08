@@ -24,6 +24,15 @@
     --book-width: 160px;
     --book-height: 240px;
     --book-thick: 40px;
+
+    /* Z-Index Scale */
+    --z-base: 1;
+    --z-book-hover: 100;
+    --z-header: 500;
+    --z-overlay: 900;
+    --z-modal: 1000;
+    --z-tooltip: 1500;
+    --z-toast: 2000;
 }
 
 [data-theme="night"] {
