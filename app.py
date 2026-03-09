@@ -9,9 +9,15 @@ from dotenv import load_dotenv
 import os
 import logging
 from datetime import datetime, timedelta
+
+# Load environment variables from .env file BEFORE importing config
+load_dotenv()
+
+from config import app_config, setup_logging
 from ai_service import generate_book_note, get_ai_recommendations, get_book_mood_tags_safe, generate_chat_response, llm_service
 from models import db, User, Book, ShelfItem, BookNote, ReadingGoal, ReadingStats, Collection, CollectionItem, PriceHistory, PriceAlert, Review, register_user, login_user
 from price_tracker import get_price_tracker
+from cache_service import cache_service
 from validators import (
     validate_request,
     AnalyzeMoodRequest,
@@ -48,8 +54,8 @@ from error_responses import (
     internal_error, service_unavailable_error
 )
 
-# Load environment variables from .env file
-load_dotenv()
+# Setup logging from configuration
+logger = setup_logging(app_config)
 
 # Configure logging
 logging.basicConfig(
@@ -69,14 +75,18 @@ try:
     MOOD_ANALYSIS_AVAILABLE = True
 except ImportError:
     MOOD_ANALYSIS_AVAILABLE = False
-    import logging
-    logging.getLogger(__name__).warning("Mood analysis package not available - some endpoints will be disabled")
+    logger.warning("Mood analysis package not available - some endpoints will be disabled")
 
 app = Flask(__name__, static_folder='.', static_url_path='')
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'default-dev-secret-key')
-app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(days=7)
+
+# Apply configuration to Flask app
+app.config.update(app_config.flask_config)
+
 jwt = JWTManager(app)
 CORS(app)
+
+# Initialize cache service
+cache_service.init_app(app)
 
 @app.errorhandler(404)
 def page_not_found(e):
@@ -86,8 +96,7 @@ def page_not_found(e):
     # Serve custom HTML for browser requests
     return app.send_static_file('404.html'), 404
 
-RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX_REQUESTS = 30
+# Rate limiting configuration from centralized config
 _request_log = defaultdict(deque)
 _request_calls = 0
 
@@ -101,19 +110,22 @@ def _cleanup_expired_keys(cutoff: float) -> None:
 
 def _rate_limited(endpoint: str) -> tuple[bool, int]:
     """Sliding window limiter per IP/endpoint, returns limit flag and wait time."""
+    if not app_config.rate_limit.enabled:
+        return False, 0
+    
     global _request_calls
     key = f"{request.remote_addr}|{endpoint}"
     now = time()
-    window_start = now - RATE_LIMIT_WINDOW
+    window_start = now - app_config.rate_limit.window_seconds
     _request_calls += 1
 
     dq = _request_log[key]
     while dq and dq[0] <= window_start:
         dq.popleft()
 
-    if len(dq) >= RATE_LIMIT_MAX_REQUESTS:
+    if len(dq) >= app_config.rate_limit.max_requests:
         oldest = dq[0]
-        retry_after = max(1, ceil(RATE_LIMIT_WINDOW - (now - oldest)))
+        retry_after = max(1, ceil(app_config.rate_limit.window_seconds - (now - oldest)))
         return True, retry_after
 
     dq.append(now)
@@ -124,27 +136,11 @@ def _rate_limited(endpoint: str) -> tuple[bool, int]:
     return False, 0
 
 
-def rate_limit(endpoint_name: str, max_requests: int = None):
-    """Decorator to apply rate limiting to an endpoint.
-    
-    Args:
-        endpoint_name: The name of the endpoint for rate limiting
-        max_requests: Optional custom max requests limit (uses RATE_LIMIT_MAX_REQUESTS if not provided)
-    """
+def rate_limit(endpoint_name: str):
+    """Decorator to apply rate limiting to an endpoint."""
     def decorator(f):
         def wrapped(*args, **kwargs):
-            # Use custom max_requests if provided, otherwise use global default
-            global RATE_LIMIT_MAX_REQUESTS
-            original_max = RATE_LIMIT_MAX_REQUESTS
-            try:
-                if max_requests is not None:
-                    RATE_LIMIT_MAX_REQUESTS = max_requests
-                
-                limited, retry_after = _rate_limited(endpoint_name)
-            finally:
-                if max_requests is not None:
-                    RATE_LIMIT_MAX_REQUESTS = original_max
-                    
+            limited, retry_after = _rate_limited(endpoint_name)
             if limited:
                 response = jsonify({
                     "success": False,
@@ -170,16 +166,16 @@ def _validate_jwt_secret_startup():
     Validate JWT_SECRET_KEY at application startup.
     This function runs before the server starts to prevent insecure configurations.
     """
-    is_prod = is_production_mode()
-    is_valid, message = validate_jwt_secret()
+    is_valid, errors = app_config.validate()
     
     if not is_valid:
-        if is_prod:
+        if app_config.is_production():
             # In production, refuse to start with insecure configuration
             logger.critical("=" * 70)
             logger.critical("CRITICAL SECURITY ERROR - APPLICATION REFUSING TO START")
             logger.critical("=" * 70)
-            logger.critical(f"\n{message}")
+            for error in errors:
+                logger.critical(f"  - {error}")
             logger.critical("\nFor production deployment, you MUST:")
             logger.critical("  1. Set JWT_SECRET_KEY environment variable to a secure value")
             logger.critical("  2. Use a minimum of 32 characters for the secret key")
@@ -192,19 +188,21 @@ def _validate_jwt_secret_startup():
         else:
             # In development, show warning but allow startup
             logger.warning("=" * 70)
-            logger.warning("WARNING: INSECURE JWT SECRET KEY CONFIGURATION")
+            logger.warning("WARNING: CONFIGURATION ISSUES DETECTED")
             logger.warning("=" * 70)
-            logger.warning(f"\n{message}")
+            for error in errors:
+                logger.warning(f"  - {error}")
             logger.warning("\nThis is acceptable for DEVELOPMENT only.")
-            logger.warning("For production, you MUST set a secure JWT_SECRET_KEY.")
+            logger.warning("For production, you MUST fix these configuration issues.")
             logger.warning("=" * 70)
     else:
-        # Secret is valid, show confirmation in development mode
-        if not is_prod:
+        # Configuration is valid, show confirmation in development mode
+        if app_config.is_development():
             logger.info("=" * 70)
-            logger.info("JWT SECRET KEY CONFIGURATION: OK")
+            logger.info("CONFIGURATION VALIDATION: OK")
             logger.info("=" * 70)
-            logger.info("Using a secure JWT secret key.")
+            logger.info(f"Environment: {app_config.get_environment_name()}")
+            logger.info(f"Rate limiting: {'Enabled' if app_config.rate_limit.enabled else 'Disabled'}")
             logger.info("=" * 70)
 
 
@@ -341,7 +339,7 @@ def handle_mood_search():
 @app.route('/api/v1/generate-note', methods=['POST'])
 @rate_limit('generate_note')
 def handle_generate_note():
-    """Generate AI-powered book note with optional mood analysis."""
+    """Generate AI-powered book recommendation with vibe support."""
     try:
         data = request.get_json()
         
@@ -350,9 +348,11 @@ def handle_generate_note():
         if not is_valid:
             return jsonify(validated_data), 400
         
+        # Extract parameters with support for new vibe field
         description = validated_data.description
         title = validated_data.title
         author = validated_data.author
+        vibe = getattr(validated_data, 'vibe', 'cozy discovery')
         
         # Check cache
         cached_note = BookNote.query.filter_by(book_title=title, book_author=author).first()
@@ -360,19 +360,27 @@ def handle_generate_note():
             logger.debug(f"Cache hit for {title} by {author}")
             return success_response(data={"vibe": cached_note.content})
         
-        vibe = generate_book_note(description, title, author)
+        # Generate AI recommendation with vibe context
+        recommendation = generate_book_note(description, title, author, vibe)
         
-        # Save to cache
+        # Save to cache if we have valid data
         try:
-            if vibe and title and author: # Ensure we have valid data to cache
-                new_note = BookNote(book_title=title, book_author=author, content=vibe)
+            if recommendation and isinstance(recommendation, dict):
+                # For structured responses, cache the vibe content
+                cache_content = recommendation.get('vibe', recommendation.get('bookseller_note', str(recommendation)))
+                new_note = BookNote(book_title=title, book_author=author, content=cache_content)
+                db.session.add(new_note)
+                db.session.commit()
+            elif isinstance(recommendation, str):
+                # For legacy string responses
+                new_note = BookNote(book_title=title, book_author=author, content=recommendation)
                 db.session.add(new_note)
                 db.session.commit()
         except Exception as e:
             logger.error(f"Failed to cache note: {e}")
             db.session.rollback()
 
-        return success_response(data={"vibe": vibe})
+        return success_response(data=recommendation)
         
     except Exception as e:
         return internal_error(str(e))
@@ -419,7 +427,9 @@ def handle_chat():
 
 @app.route('/api/v1/health', methods=['GET'])
 def health_check():
-    """Health check endpoint."""
+    """Health check endpoint with cache statistics."""
+    cache_stats = cache_service.get_stats()
+    
     return jsonify({
         "status": "healthy",
         "service": "BiblioDrift AI Service",
@@ -430,8 +440,10 @@ def health_check():
             "openai_configured": llm_service.openai_client is not None,
             "groq_configured": llm_service.groq_client is not None,
             "gemini_configured": llm_service.gemini_client is not None,
-            "preferred_llm": llm_service.preferred_llm
-        }
+            "preferred_llm": llm_service.preferred_llm,
+            "caching_enabled": cache_stats.get('cache_type') != 'null'
+        },
+        "cache": cache_stats
     })
 
 
@@ -645,10 +657,7 @@ def remove_from_library(item_id):
         return internal_error(str(e))
 
 
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///biblio.db')
-if app.config['SQLALCHEMY_DATABASE_URI'] and app.config['SQLALCHEMY_DATABASE_URI'].startswith("postgres://"):
-    app.config['SQLALCHEMY_DATABASE_URI'] = app.config['SQLALCHEMY_DATABASE_URI'].replace("postgres://", "postgresql://", 1)
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Database configuration is now handled by centralized config
 db.init_app(app)
 
 # Initialize price tracker with database
@@ -735,7 +744,7 @@ def sync_library():
         return internal_error(str(e))
 
 @app.route('/api/v1/register', methods=['POST'])
-@rate_limit('auth', max_requests=5)
+@rate_limit('auth')
 def register():
     """Register a new user and return JWT token."""
     try:
@@ -777,7 +786,7 @@ def register():
         return validation_error(str(e))
 
 @app.route('/api/v1/login', methods=['POST'])
-@rate_limit('auth', max_requests=5)
+@rate_limit('auth')
 def login():
     """Authenticate user and return JWT token."""
     try:
@@ -1572,13 +1581,12 @@ with app.app_context():
     db.create_all()  # creates User & ShelfItem tables
 
 if __name__ == '__main__':
-    import os
-    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
-    port = int(os.getenv('PORT', 5000))
-    host = os.getenv('FLASK_HOST', '127.0.0.1')  # Default to localhost for security
+    # Use centralized configuration for server settings
+    server_config = app_config.server
     
-    if debug_mode:
-        logger.info("--- BIBLIODRIFT MOOD ANALYSIS SERVER STARTING ON PORT %d ---", port)
+    if server_config.debug:
+        logger.info("--- BIBLIODRIFT MOOD ANALYSIS SERVER STARTING ON PORT %d ---", server_config.port)
+        logger.info("Environment: %s", app_config.get_environment_name())
         logger.info("Available endpoints:")
         logger.info("  POST /api/v1/generate-note - Generate AI book notes")
         if MOOD_ANALYSIS_AVAILABLE:
@@ -1589,5 +1597,9 @@ if __name__ == '__main__':
         logger.info("  POST /api/v1/mood-search - Search books by mood/vibe")
         logger.info("  POST /api/v1/chat - Chat with bookseller")
         logger.info("  GET  /api/v1/health - Health check")
+        logger.info("Rate limiting: %s (window: %ds, max: %d requests)", 
+                   "Enabled" if app_config.rate_limit.enabled else "Disabled",
+                   app_config.rate_limit.window_seconds,
+                   app_config.rate_limit.max_requests)
     
-    app.run(debug=debug_mode, port=port, host=host)
+    app.run(debug=server_config.debug, port=server_config.port, host=server_config.host)

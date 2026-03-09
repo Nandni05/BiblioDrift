@@ -3,13 +3,9 @@
  * Handles 3D rendering, API fetching, Persistent Auth, and Genre Browsing.
  */
 
-// Load configuration from config.js
-// Note: config.js should be loaded before app.js in HTML
-const API_BASE = typeof CONFIG !== 'undefined' ? CONFIG.API_BASE : 'https://www.googleapis.com/books/v1/volumes';
-const MOOD_API_BASE = typeof CONFIG !== 'undefined' ? CONFIG.MOOD_API_BASE : '/api/v1';
-
-// Expose MOOD_API_BASE globally for chat.js
-window.MOOD_API_BASE = MOOD_API_BASE;
+const API_BASE = 'https://www.googleapis.com/books/v1/volumes';
+const API_KEY = 'YOUR_GOOGLE_BOOKS_API_KEY';
+const MOOD_API_BASE = 'http://localhost:5000/api/v1';
 
 let GOOGLE_API_KEY = '';
 
@@ -128,34 +124,19 @@ class BookRenderer {
         const scene = document.createElement('div');
         scene.className = 'book-scene';
 
-        // Badge Logic
-        let badgesHTML = '';
-        const isNew = bookData.date_added && (new Date() - new Date(bookData.date_added)) < (7 * 24 * 60 * 60 * 1000);
-        const isPopular = volumeInfo.ratingsCount && volumeInfo.ratingsCount > 1000;
-        
-        if (isNew || isPopular || categories.length > 0) {
-            badgesHTML += '<div class="book-badge-container">';
-            if (isNew) badgesHTML += '<span class="book-badge badge-new">New</span>';
-            if (isPopular) badgesHTML += '<span class="book-badge badge-popular">Popular</span>';
-            if (categories.length > 0) {
-                const mainGenre = categories[0].split(' / ')[0]; // Take first category part
-                badgesHTML += `<span class="book-badge badge-genre" title="${mainGenre}">${mainGenre}</span>`;
-            }
-            badgesHTML += '</div>';
-        }
-
         // Load flip sound
         const flipSound = new Audio('assets/sounds/page-flip.mp3');
         flipSound.volume = 0.5;
 
         scene.innerHTML = `
-            ${badgesHTML}
             <div class="book" data-id="${id}">
                 <div class="book__face book__face--front">
                     <img src="${thumb.replace('http:', 'https:')}" alt="${title}">
                 </div>
                 <div class="book__face book__face--spine" style="background: ${randomSpine}"></div>
-                <div class="book__face book_face--right"></div>
+                <div class="book__face book__face--right"></div>
+                <div class="book__face book__face--top"></div>
+                <div class="book__face book__face--bottom"></div>
                 <div class="book__face book__face--back">
                     <div style="overflow-y: auto; height: 100%; padding-right: 5px; scrollbar-width: thin;">
                         <div style="font-weight: bold; font-size: 0.9rem; margin-bottom: 0.5rem; color: var(--text-main);">${title}</div>
@@ -341,8 +322,7 @@ class LibraryManager {
             want: [],
             finished: []
         };
-        // Use relative path from config for proxy-aware deployment
-        this.apiBase = typeof CONFIG !== 'undefined' ? CONFIG.MOOD_API_BASE : '/api/v1';
+        this.apiBase = 'http://localhost:5000/api/v1';
 
         // Sync API if user is logged in
         this.syncWithBackend();
@@ -620,7 +600,6 @@ class LibraryManager {
         }
         return null;
     }
-    // Issue #23: Implements removing a book from local array and database
     async removeBook(id) {
         const result = this.findBookInShelf(id);
         if (result) {
@@ -820,53 +799,13 @@ class GenreManager {
         }
     }
 
-    renderBooks(books) {
+    async renderBooks(books) {
         this.booksGrid.innerHTML = '';
-
-        books.forEach(book => {
-            const info = book.volumeInfo;
-            const title = info.title || 'Untitled';
-            const author = info.authors ? info.authors[0] : 'Unknown';
-            const thumbnail = info.imageLinks ?
-                (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail) :
-                'https://via.placeholder.com/128x196?text=No+Cover';
-            const categories = info.categories || [];
-
-            // Badge Logic
-            let badgesHTML = '';
-            const isNew = book.date_added && (new Date() - new Date(book.date_added)) < (7 * 24 * 60 * 60 * 1000);
-            const isPopular = info.ratingsCount && info.ratingsCount > 1000;
-            
-            if (isNew || isPopular || categories.length > 0) {
-                badgesHTML += '<div class="book-badge-container">';
-                if (isNew) badgesHTML += '<span class="book-badge badge-new">New</span>';
-                if (isPopular) badgesHTML += '<span class="book-badge badge-popular">Popular</span>';
-                if (categories.length > 0) {
-                    const mainGenre = categories[0].split(' / ')[0]; // Take first category part
-                    badgesHTML += `<span class="book-badge badge-genre" title="${mainGenre}">${mainGenre}</span>`;
-                }
-                badgesHTML += '</div>';
-            }
-
-            const card = document.createElement('div');
-            card.className = 'genre-book-card';
-            card.innerHTML = `
-                ${badgesHTML}
-                <img src="${thumbnail}" alt="${title}" loading="lazy">
-                <div class="genre-book-info">
-                    <h4>${title}</h4>
-                    <p>${author}</p>
-                </div>
-            `;
-
-            // Add click listener to open detailed view (using existing renderer logic if possible, or just mock it)
-            // For now, let's just use the existing BookRenderer's modal if accessible, 
-            // or just simple log. The user asked for "modal should open up with some books". 
-            // The books themselves inside the modal don't necessarily need to open *another* modal, 
-            // but it would be nice.
-
-            this.booksGrid.appendChild(card);
-        });
+        const renderer = new BookRenderer(new LibraryManager());
+        for (const book of books) {
+            const el = await renderer.createBookElement(book);
+            this.booksGrid.appendChild(el);
+        }
     }
 }
 
@@ -1131,9 +1070,7 @@ async function handleAuth(event) {
         btn.textContent = 'Processing...';
         btn.disabled = true;
 
-        // Use dynamic base URL for proxy-aware deployment
-        const API_BASE_URL = window.location.origin;
-        const res = await fetch(`${API_BASE_URL}${endpoint}`, {
+        const res = await fetch(`http://localhost:5000${endpoint}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -1357,4 +1294,3 @@ if (document.readyState === 'loading') {
 } else {
     KeyboardShortcuts.init();
 }
-
