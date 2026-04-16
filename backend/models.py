@@ -49,7 +49,7 @@ class ShelfItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=False)
-    shelf_type = db.Column(db.String(50), nullable=False)  # 'want', 'current', 'finished'
+    shelf_type = db.Column(db.Enum('want', 'current', 'finished', name='shelf_item_types'), nullable=False)
     progress = db.Column(db.Integer, default=0)
     rating = db.Column(db.Integer)
     finished_at = db.Column(db.DateTime, nullable=True)  # Timestamp when book was marked as finished
