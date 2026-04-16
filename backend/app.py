@@ -14,7 +14,7 @@ import os
 import requests
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sanitizer import sanitize_payload
 
 # Load environment variables from .env file BEFORE importing config
@@ -559,7 +559,7 @@ def get_library(user_id):
 # ==================== READING STATS HELPER FUNCTIONS ====================
 def _update_reading_stats(user_id, book):
     """Update reading stats when a book is finished."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     year = now.year
     month = now.month
     
@@ -601,7 +601,7 @@ def _calculate_reading_streak(user_id):
         return 0
     
     # Check if the most recent finish was today or yesterday
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     today = now.date()
     most_recent = finished_items[0].finished_at.date()
     
@@ -684,7 +684,7 @@ def update_library_item(item_id):
             item.progress = validated_data.progress
             if item.progress == 100:
                 item.shelf_type = 'finished'
-                item.finished_at = datetime.utcnow()
+                item.finished_at = datetime.now(timezone.utc)
         
         if validated_data.rating is not None:
             item.rating = validated_data.rating
@@ -1006,7 +1006,7 @@ def get_reading_stats():
         goal = ReadingGoal.query.filter_by(user_id=user_id, year=year).first()
         
         # Get this month's stats
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         current_month_stats = ReadingStats.query.filter_by(
             user_id=user_id, year=year, month=now.month
         ).first()
