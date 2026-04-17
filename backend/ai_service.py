@@ -468,12 +468,8 @@ __all__ = [
 # Public API functions
 # ---------------------------------------------------------------------------
 
-def generate_book_note(
-    description: str,
-    title: str = "",
-    author: str = "",
-    vibe: str = "cozy discovery",
-) -> dict:
+@cache_recommendations
+def generate_book_note(description, title="", author="", vibe=""):
     """
     Generate an AI-powered bookseller note for a book.
 
