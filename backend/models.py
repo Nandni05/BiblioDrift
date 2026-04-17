@@ -1,6 +1,7 @@
 # Placeholder for database models.
 # Define SQLAlchemy models for 'User' and 'ShelfItem' here.
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 import logging
@@ -48,14 +49,18 @@ class ShelfItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=False)
-    shelf_type = db.Column(db.String(50), nullable=False)  # 'want', 'current', 'finished'
+    shelf_type = db.Column(db.Enum('want', 'current', 'finished', name='shelf_item_types'), nullable=False)
     progress = db.Column(db.Integer, default=0)
     rating = db.Column(db.Integer)
     finished_at = db.Column(db.DateTime, nullable=True)  # Timestamp when book was marked as finished
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     # Price tracking fields
     price_alert = db.Column(db.Boolean, default=False)  # Enable/disable price alerts
     target_price = db.Column(db.Float, nullable=True)  # User's target price for alerts
+
+    # Versioning for optimistic locking
+    version = db.Column(db.Integer, default=1, nullable=False)
 
     # Relationships
     user = db.relationship('User', backref=db.backref('shelf_items', lazy=True))
@@ -75,8 +80,10 @@ class ShelfItem(db.Model):
             "rating": self.rating,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "price_alert": self.price_alert,
-            "target_price": self.target_price
+            "target_price": self.target_price,
+            "version": self.version
         }
 
 class BookNote(db.Model):
@@ -217,9 +224,12 @@ def register_user(username, email, password):
     try:
         db.session.commit()
         logger.info("User registered successfully")
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        logger.error(f"Database error registering user: {e}")
     except Exception as e:
         db.session.rollback()
-        logger.error(f"Error registering user: {e}")
+        logger.error(f"Unexpected error registering user: {e}")
 
 def login_user(identifier, password):
     # Try finding by username first

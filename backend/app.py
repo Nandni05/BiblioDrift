@@ -3,8 +3,12 @@
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, 
+    get_jwt_identity, set_access_cookies, unset_jwt_cookies
+)
 from sqlalchemy.orm import joinedload
+from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 import os
 import requests
@@ -88,7 +92,7 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 app.config.update(app_config.flask_config)
 
 jwt = JWTManager(app)
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # Initialize cache service
 cache_service.init_app(app)
@@ -366,7 +370,11 @@ def handle_mood_search():
             }
         )
         
+    except SQLAlchemyError as e:
+        logger.error(f"Database error searching mood: {e}")
+        return internal_error("A database error occurred during search.")
     except Exception as e:
+        logger.error(f"Unexpected error searching mood: {e}")
         return internal_error(str(e))
 
 @app.route('/api/v1/generate-note', methods=['POST'])
@@ -409,8 +417,11 @@ def handle_generate_note():
                 new_note = BookNote(book_title=title, book_author=author, content=recommendation)
                 db.session.add(new_note)
                 db.session.commit()
+        except SQLAlchemyError as e:
+            logger.error(f"Database error caching note: {e}")
+            db.session.rollback()
         except Exception as e:
-            logger.error(f"Failed to cache note: {e}")
+            logger.error(f"Unexpected error caching note: {e}")
             db.session.rollback()
 
         return success_response(data=recommendation)
@@ -511,10 +522,11 @@ def add_to_library():
             db.session.flush() # Flush to get book.id without committing
 
         # Check if ShelfItem exists
-        existing_item = ShelfItem.query.filter_by(user_id=validated_data.user_id, book_id=book.id).first()
+        existing_item = ShelfItem.query.filter_by(user_id=validated_data.user_id, book_id=book.id).with_for_update().first()
         if existing_item:
             # Update shelf if exists
             existing_item.shelf_type = validated_data.shelf_type.value
+            existing_item.version += 1
             item = existing_item
         else:
             item = ShelfItem(
@@ -529,7 +541,12 @@ def add_to_library():
             data={"message": "Book added to shelf", "item": item.to_dict()},
             status_code=201
         )
+    except SQLAlchemyError as e:
+        logger.error(f"Database error adding to library: {e}")
+        db.session.rollback()
+        return internal_error("A database error occurred while adding the book.")
     except Exception as e:
+        logger.error(f"Unexpected error adding to library: {e}")
         db.session.rollback()
         return internal_error(str(e))
 
@@ -652,20 +669,46 @@ def update_library_item(item_id):
         if not is_valid:
             return jsonify(validated_data), 400
         
-        item = ShelfItem.query.get(item_id)
+        item = ShelfItem.query.with_for_update().get(item_id)
         if not item:
             return not_found_error("Library item")
             
         if str(item.user_id) != str(current_user_id):
              return forbidden_error("Cannot modify another user's library item")
 
+        # Optimistic locking check
+        if validated_data.version is not None and item.version != validated_data.version:
+            return error_response(
+                ErrorCodes.CONFLICT, 
+                "The item has been modified on another device. Please refresh and try again.", 
+                409,
+                additional_data={"current_version": item.version, "server_item": item.to_dict()}
+            )
+
         # Update fields if provided
         if validated_data.shelf_type is not None:
             item.shelf_type = validated_data.shelf_type.value
+        
+        if validated_data.progress is not None:
+            item.progress = validated_data.progress
+            if item.progress == 100:
+                item.shelf_type = 'finished'
+                item.finished_at = datetime.utcnow()
+        
+        if validated_data.rating is not None:
+            item.rating = validated_data.rating
+
+        # Increment version on update
+        item.version += 1
             
         db.session.commit()
         return success_response(data={"message": "Item updated", "item": item.to_dict()})
+    except SQLAlchemyError as e:
+        logger.error(f"Database error updating library item: {e}")
+        db.session.rollback()
+        return internal_error("A database error occurred while updating the item.")
     except Exception as e:
+        logger.error(f"Unexpected error updating library item: {e}")
         db.session.rollback()
         return internal_error(str(e))
 
@@ -685,7 +728,12 @@ def remove_from_library(item_id):
         db.session.delete(item)
         db.session.commit()
         return success_response(data={"message": "Item removed"})
+    except SQLAlchemyError as e:
+        logger.error(f"Database error removing from library: {e}")
+        db.session.rollback()
+        return internal_error("A database error occurred while removing the item.")
     except Exception as e:
+        logger.error(f"Unexpected error removing from library: {e}")
         db.session.rollback()
         return internal_error(str(e))
 
@@ -723,66 +771,86 @@ def sync_library():
             return forbidden_error("Cannot sync to another user's library")
         
         synced_count = 0
+        conflicts = 0
         errors = 0
         
         for item_data in items:
             try:
-                # Validate required fields for each item
-                if not isinstance(item_data, dict):
-                    errors += 1
-                    continue
+                # Use savepoint for each item so one failure doesn't roll back the whole sync
+                with db.session.begin_nested():
+                    # Validate required fields for each item
+                    if not isinstance(item_data, dict):
+                        errors += 1
+                        continue
+                        
+                    google_id = item_data.get('id')
+                    if not google_id:
+                        errors += 1
+                        continue
                     
-                google_id = item_data.get('id')
-                if not google_id:
-                    errors += 1
-                    continue
-                
-                # Sanitize google_id to prevent injection
-                google_id = sanitize_string(str(google_id), max_len=100)
-                
-                # 1. Ensure Book Exists
-                book = Book.query.filter_by(google_books_id=google_id).first()
-                
-                if not book:
-                    volume_info = item_data.get('volumeInfo', {})
-                    image_links = volume_info.get('imageLinks', {})
-                    authors = volume_info.get('authors', [])
-                    if isinstance(authors, list):
-                        authors = ", ".join(sanitize_string(str(a)) for a in authors)
-                    else:
-                        authors = sanitize_string(str(authors))
+                    # 1. Ensure Book Exists
+                    book = Book.query.filter_by(google_books_id=google_id).first()
+                    
+                    if not book:
+                        volume_info = item_data.get('volumeInfo', {})
+                        image_links = volume_info.get('imageLinks', {})
+                        authors = volume_info.get('authors', [])
+                        if isinstance(authors, list):
+                            authors = ", ".join(authors)
 
-                    book = Book(
-                        google_books_id=google_id,
-                        title=sanitize_string(str(volume_info.get('title', 'Untitled'))),
-                        authors=authors,
-                        thumbnail=sanitize_string(str(image_links.get('thumbnail', '')), max_len=500)
-                    )
-                    db.session.add(book)
-                    db.session.commit() # Need ID for next step
+                        book = Book(
+                            google_books_id=google_id,
+                            title=volume_info.get('title', 'Untitled'),
+                            authors=authors,
+                            thumbnail=image_links.get('thumbnail', '')
+                        )
+                        db.session.add(book)
+                        db.session.flush() # Get ID
 
-                # 2. Check ShelfItem
-                existing_item = ShelfItem.query.filter_by(user_id=user_id, book_id=book.id).first()
-                if not existing_item:
+                    # 2. Check ShelfItem with lock
+                    existing_item = ShelfItem.query.filter_by(user_id=user_id, book_id=book.id).with_for_update().first()
                     shelf_type = item_data.get('shelf', 'want')
-                    # Validate shelf type against whitelist
                     if shelf_type not in ['want', 'current', 'finished']:
                         shelf_type = 'want'
+
+                    if not existing_item:
+                        new_item = ShelfItem(
+                            user_id=user_id,
+                            book_id=book.id,
+                            shelf_type=shelf_type,
+                            progress=item_data.get('progress', 0)
+                        )
+                        db.session.add(new_item)
+                        synced_count += 1
+                    else:
+                        # Conflict Handling / Merge Strategy
+                        remote_version = item_data.get('version')
+                        if remote_version and remote_version < existing_item.version:
+                            # Backend is newer, consider this a potential collision
+                            conflicts += 1
+                            continue 
                         
-                    new_item = ShelfItem(
-                        user_id=user_id,
-                        book_id=book.id,
-                        shelf_type=shelf_type
-                    )
-                    db.session.add(new_item)
-                    synced_count += 1
+                        # Update existing
+                        existing_item.shelf_type = shelf_type
+                        existing_item.progress = item_data.get('progress', existing_item.progress)
+                        existing_item.version += 1
+                        synced_count += 1
                     
-            except Exception:
+            except SQLAlchemyError as e:
+                logger.error(f"Database error syncing item {item_data.get('id', 'unknown')}: {e}")
+                # Savepoint will be rolled back by the nested transaction block
                 errors += 1
-                db.session.rollback() # Rollback on individual item error but continue
+            except Exception as e:
+                logger.error(f"Unexpected error syncing item {item_data.get('id', 'unknown')}: {e}")
+                errors += 1
+                # begin_nested() automatically rolls back on exception within the block
         
         db.session.commit()
-        return success_response(data={"message": f"Synced {synced_count} items", "errors": errors})
+        return success_response(data={
+            "message": f"Synced {synced_count} items", 
+            "errors": errors,
+            "conflicts": conflicts
+        })
     except Exception as e:
         db.session.rollback()
         return internal_error(str(e))
@@ -814,10 +882,9 @@ def register():
         # Create JWT token
         access_token = create_access_token(identity=str(user.id))
         
-        return success_response(
+        resp, status = success_response(
             data={
                 "message": "User registered successfully",
-                "access_token": access_token,
                 "user": {
                     "id": user.id,
                     "username": user.username,
@@ -826,6 +893,8 @@ def register():
             },
             status_code=201
         )
+        set_access_cookies(resp, access_token)
+        return resp, status
     except Exception as e:
         return validation_error(str(e))
 
@@ -851,10 +920,9 @@ def login():
             # Create JWT token
             access_token = create_access_token(identity=str(user.id))
             
-            return success_response(
+            resp, status = success_response(
                 data={
                     "message": "Login successful",
-                    "access_token": access_token,
                     "user": {
                         "id": user.id,
                         "username": user.username,
@@ -862,10 +930,20 @@ def login():
                     }
                 }
             )
+            set_access_cookies(resp, access_token)
+            return resp, status
             
         return auth_error("Invalid username or password")
     except Exception as e:
         return internal_error(str(e))
+
+
+@app.route('/api/v1/logout', methods=['POST'])
+def logout():
+    """Clear JWT cookies for logout."""
+    resp, status = success_response(message="Logout successful")
+    unset_jwt_cookies(resp)
+    return resp, status
 
 
 # ==================== READING STATS ENDPOINTS ====================
